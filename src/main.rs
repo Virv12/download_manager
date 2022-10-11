@@ -27,6 +27,10 @@ struct Segment {
     size: usize,
 }
 
+const THREADS: usize = 64;
+const SEGMENT: usize = (2 * 1 << 30) / THREADS;
+const BUFFER: usize = 1 << 20;
+
 /// Performs an HTTP/HEAD request and returns the content-length or `None` if not specified
 /// TODO: checking for Accept-Ranges: bytes?
 fn get_size(url: &str) -> Option<usize> {
@@ -135,7 +139,7 @@ fn thread_handler(rx: Arc<Mutex<Receiver<Segment>>>) {
             }
         }
 
-        let mut buf = [0u8; 4 << 10];
+        let mut buf = [0u8; BUFFER];
         loop {
             let x = reader.read(&mut buf).unwrap();
             if x == 0 {
@@ -159,7 +163,7 @@ impl DownloadManager {
         let (tx, rx) = mpsc::channel();
         let rx = Arc::new(Mutex::new(rx));
         // TODO: get number of threads
-        let handles = (0..12)
+        let handles = (0..THREADS)
             .map(|_| {
                 let rx = rx.clone();
                 thread::spawn(move || thread_handler(rx))
@@ -187,7 +191,7 @@ impl DownloadManager {
         };
         let arc = Arc::new(meta);
         let mut offset = 0;
-        let segment_size = 32 << 20;
+        let segment_size = SEGMENT;
         while offset < size {
             let segment = Segment {
                 meta: arc.clone(),
