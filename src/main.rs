@@ -179,13 +179,14 @@ impl DownloadManager {
         }
     }
 
-    fn download(&mut self, url: String) -> usize {
+    fn download(&mut self, url: String, path: String) -> usize {
         let size = get_size(&url).unwrap();
+        File::create(&path).unwrap();
         let id = self.id;
         self.id += 1;
         let meta = Meta {
             url,
-            path: "download".into(),
+            path,
             partial: Default::default(),
             size,
         };
@@ -230,7 +231,7 @@ fn main() {
     std::io::stdin().read_line(&mut url).unwrap();
 
     let mut dm = DownloadManager::new();
-    let id = dm.download(url.trim().into());
+    let id = dm.download(url.trim().into(), "download".into());
     while !dm.completed(id) {
         println!("{}", dm.progress(id));
         thread::sleep(Duration::from_secs(1));
