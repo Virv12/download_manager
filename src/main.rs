@@ -14,86 +14,16 @@ use std::{
 
 use urlparse::Url;
 
-struct Meta {
-    url: String,
-    path: String,
-    partial: AtomicUsize,
-    size: usize,
+enum Location {
+    Http {
+        netloc: String,
+        hostname: String,
+        uri: String,
+    },
 }
 
-struct Segment {
-    meta: Arc<Meta>,
-    offset: usize,
-    size: usize,
-}
-
-const THREADS: usize = 64;
-const SEGMENT: usize = (2 * 1 << 30) / THREADS;
-const BUFFER: usize = 1 << 20;
-
-/// Performs an HTTP/HEAD request and returns the content-length or `None` if not specified
-/// TODO: checking for Accept-Ranges: bytes?
-fn get_size(url: &str) -> Option<usize> {
-    let Url {
-        scheme,
-        mut netloc,
-        path,
-        query,
-        fragment,
-        hostname,
-        port,
-        ..
-    } = urlparse::urlparse(url);
-
-    assert_eq!(scheme, "http");
-
-    if port.is_none() {
-        netloc += ":80";
-    }
-
-    let mut uri = path;
-    if let Some(query) = &query {
-        uri.push('?');
-        uri += query;
-    }
-    if let Some(fragment) = &fragment {
-        uri.push('#');
-        uri += fragment;
-    }
-
-    let mut stream = TcpStream::connect(netloc).unwrap();
-    write!(stream, "HEAD {} HTTP/1.0\r\n", uri).unwrap();
-    write!(stream, "Host: {}\r\n", hostname.unwrap()).unwrap();
-    write!(stream, "\r\n").unwrap();
-
-    // TODO: do we really want a BufRead?
-    let mut reader = BufReader::new(stream);
-    let mut buf = String::new();
-
-    loop {
-        buf.clear();
-        let n = reader.read_line(&mut buf).unwrap();
-        if n <= 2 {
-            break;
-        }
-        buf.make_ascii_lowercase();
-        if let Some(x) = buf.strip_prefix("content-length: ") {
-            let y: usize = x.trim().parse().unwrap();
-            return Some(y);
-        }
-    }
-
-    None
-}
-
-fn thread_handler(rx: Arc<Mutex<Receiver<Segment>>>) {
-    while let Ok(Segment { meta, offset, size }) = {
-        let lock = rx.lock().unwrap();
-        lock.recv()
-    } {
-        let mut file = File::options().write(true).open(&meta.path).unwrap();
-        file.seek(SeekFrom::Start(offset as u64)).unwrap();
-
+impl From<String> for Location {
+    fn from(url: String) -> Location {
         let Url {
             scheme,
             mut netloc,
@@ -103,7 +33,7 @@ fn thread_handler(rx: Arc<Mutex<Receiver<Segment>>>) {
             hostname,
             port,
             ..
-        } = urlparse::urlparse(&meta.url);
+        } = urlparse::urlparse(url);
 
         assert_eq!(scheme, "http");
 
@@ -121,32 +51,108 @@ fn thread_handler(rx: Arc<Mutex<Receiver<Segment>>>) {
             uri += fragment;
         }
 
-        let mut stream = TcpStream::connect(netloc).unwrap();
-
-        write!(stream, "GET {} HTTP/1.0\r\n", uri).unwrap();
-        write!(stream, "Host: {}\r\n", hostname.unwrap()).unwrap();
-        write!(stream, "Range: bytes={}-{}\r\n", offset, offset + size - 1).unwrap();
-        write!(stream, "\r\n").unwrap();
-
-        // TODO: do we really want a BufRead?
-        let mut reader = BufReader::new(stream);
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            let n = reader.read_line(&mut buf).unwrap();
-            if n <= 2 {
-                break;
-            }
+        Location::Http {
+            netloc,
+            hostname: hostname.unwrap(),
+            uri,
         }
+    }
+}
 
-        let mut buf = [0u8; BUFFER];
-        loop {
-            let x = reader.read(&mut buf).unwrap();
-            if x == 0 {
-                break;
+struct Meta {
+    loc: Location,
+    path: String,
+    partial: AtomicUsize,
+    size: usize,
+}
+
+struct Segment {
+    meta: Arc<Meta>,
+    offset: usize,
+    size: usize,
+}
+
+const THREADS: usize = 64;
+const SEGMENT: usize = (2 * 1 << 30) / THREADS;
+const BUFFER: usize = 1 << 20;
+
+/// Performs an HTTP/HEAD request and returns the content-length or `None` if not specified
+/// TODO: checking for Accept-Ranges: bytes?
+fn get_size(loc: &Location) -> Option<usize> {
+    match loc {
+        Location::Http {
+            netloc,
+            hostname,
+            uri,
+        } => {
+            let mut stream = TcpStream::connect(netloc).unwrap();
+            write!(stream, "HEAD {} HTTP/1.0\r\n", uri).unwrap();
+            write!(stream, "Host: {}\r\n", hostname).unwrap();
+            write!(stream, "\r\n").unwrap();
+
+            // TODO: do we really want a BufRead?
+            let mut reader = BufReader::new(stream);
+            let mut buf = String::new();
+
+            loop {
+                buf.clear();
+                let n = reader.read_line(&mut buf).unwrap();
+                if n <= 2 {
+                    break;
+                }
+                buf.make_ascii_lowercase();
+                if let Some(x) = buf.strip_prefix("content-length: ") {
+                    let y: usize = x.trim().parse().unwrap();
+                    return Some(y);
+                }
             }
-            meta.partial.fetch_add(x, Ordering::Relaxed);
-            file.write_all(&buf[..x]).unwrap();
+
+            None
+        }
+    }
+}
+
+fn thread_handler(rx: Arc<Mutex<Receiver<Segment>>>) {
+    while let Ok(Segment { meta, offset, size }) = {
+        let lock = rx.lock().unwrap();
+        lock.recv()
+    } {
+        let mut file = File::options().write(true).open(&meta.path).unwrap();
+        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+
+        match &meta.loc {
+            Location::Http {
+                netloc,
+                hostname,
+                uri,
+            } => {
+                let mut stream = TcpStream::connect(netloc).unwrap();
+                write!(stream, "GET {} HTTP/1.0\r\n", uri).unwrap();
+                write!(stream, "Host: {}\r\n", hostname).unwrap();
+                write!(stream, "Range: bytes={}-{}\r\n", offset, offset + size - 1).unwrap();
+                write!(stream, "\r\n").unwrap();
+
+                // TODO: do we really want a BufRead?
+                let mut reader = BufReader::new(stream);
+                let mut buf = String::new();
+                loop {
+                    buf.clear();
+                    let n = reader.read_line(&mut buf).unwrap();
+                    if n <= 2 {
+                        break;
+                    }
+                }
+
+                let mut buf = [0u8; BUFFER];
+                loop {
+                    let x = reader.read(&mut buf).unwrap();
+                    if x == 0 {
+                        break;
+                    }
+                    meta.partial.fetch_add(x, Ordering::Relaxed);
+                    file.write_all(&buf[..x]).unwrap();
+                }
+            }
         }
     }
 }
@@ -180,12 +186,13 @@ impl DownloadManager {
     }
 
     fn download(&mut self, url: String, path: String) -> usize {
-        let size = get_size(&url).unwrap();
+        let loc = url.into();
+        let size = get_size(&loc).unwrap();
         File::create(&path).unwrap();
         let id = self.id;
         self.id += 1;
         let meta = Meta {
-            url,
+            loc,
             path,
             partial: Default::default(),
             size,
