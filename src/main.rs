@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     net::TcpStream,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -59,25 +59,29 @@ impl From<String> for Location {
     }
 }
 
-struct Meta {
+struct Header {
     loc: Location,
     path: String,
-    partial: AtomicUsize,
     size: usize,
 }
 
 struct Segment {
-    meta: Arc<Meta>,
     offset: usize,
     size: usize,
+    downloaded: AtomicUsize,
+}
+
+struct Meta {
+    header: Header,
+    segments: Box<[Segment]>, // TODO: `Box`-ing is not needed
 }
 
 const THREADS: usize = 64;
-const SEGMENT: usize = (2 * 1 << 30) / THREADS;
+const SEGMENT_SIZE: usize = (2 * 1 << 30) / THREADS;
 const BUFFER: usize = 1 << 20;
 
 /// Performs an HTTP/HEAD request and returns the content-length or `None` if not specified
-/// TODO: checking for Accept-Ranges: bytes?
+// TODO: checking for Accept-Ranges: bytes?
 fn get_size(loc: &Location) -> Option<usize> {
     match loc {
         Location::Http {
@@ -112,15 +116,17 @@ fn get_size(loc: &Location) -> Option<usize> {
     }
 }
 
-fn thread_handler(rx: Arc<Mutex<Receiver<Segment>>>) {
-    while let Ok(Segment { meta, offset, size }) = {
+fn thread_handler(rx: Arc<Mutex<Receiver<(Arc<Meta>, usize)>>>) {
+    while let Ok((meta, idx)) = {
         let lock = rx.lock().unwrap();
         lock.recv()
     } {
-        let mut file = File::options().write(true).open(&meta.path).unwrap();
-        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        let hdr = &meta.header;
+        let sgm = &meta.segments[idx];
+        let mut file = File::options().write(true).open(&hdr.path).unwrap();
+        file.seek(SeekFrom::Start(sgm.offset as u64)).unwrap();
 
-        match &meta.loc {
+        match &hdr.loc {
             Location::Http {
                 netloc,
                 hostname,
@@ -129,7 +135,13 @@ fn thread_handler(rx: Arc<Mutex<Receiver<Segment>>>) {
                 let mut stream = TcpStream::connect(netloc).unwrap();
                 write!(stream, "GET {} HTTP/1.0\r\n", uri).unwrap();
                 write!(stream, "Host: {}\r\n", hostname).unwrap();
-                write!(stream, "Range: bytes={}-{}\r\n", offset, offset + size - 1).unwrap();
+                write!(
+                    stream,
+                    "Range: bytes={}-{}\r\n",
+                    sgm.offset,
+                    sgm.offset + sgm.size - 1
+                )
+                .unwrap();
                 write!(stream, "\r\n").unwrap();
 
                 // TODO: do we really want a BufRead?
@@ -149,7 +161,7 @@ fn thread_handler(rx: Arc<Mutex<Receiver<Segment>>>) {
                     if x == 0 {
                         break;
                     }
-                    meta.partial.fetch_add(x, Ordering::Relaxed);
+                    sgm.downloaded.fetch_add(x, Ordering::Relaxed);
                     file.write_all(&buf[..x]).unwrap();
                 }
             }
@@ -158,7 +170,7 @@ fn thread_handler(rx: Arc<Mutex<Receiver<Segment>>>) {
 }
 
 struct DownloadManager {
-    tx: Option<Sender<Segment>>,
+    tx: Option<Sender<(Arc<Meta>, usize)>>,
     handles: Vec<JoinHandle<()>>,
     files: BTreeMap<usize, Arc<Meta>>,
     id: usize,
@@ -191,36 +203,26 @@ impl DownloadManager {
         File::create(&path).unwrap();
         let id = self.id;
         self.id += 1;
-        let meta = Meta {
-            loc,
-            path,
-            partial: Default::default(),
-            size,
-        };
-        let arc = Arc::new(meta);
-        let mut offset = 0;
-        let segment_size = SEGMENT;
-        while offset < size {
-            let segment = Segment {
-                meta: arc.clone(),
-                offset,
-                size: segment_size.min(size - offset),
-            };
-            self.tx.as_ref().unwrap().send(segment).unwrap();
-            offset += segment_size;
+
+        let header = Header { loc, path, size };
+        let segments: Box<_> = (0..(size + SEGMENT_SIZE - 1) / SEGMENT_SIZE)
+            .map(|x| Segment {
+                offset: SEGMENT_SIZE * x,
+                size: SEGMENT_SIZE.min(size - SEGMENT_SIZE * x),
+                downloaded: Default::default(),
+            })
+            .collect();
+        let meta = Arc::new(Meta { header, segments });
+
+        for idx in 0..meta.segments.len() {
+            self.tx.as_ref().unwrap().send((meta.clone(), idx)).unwrap();
         }
-        self.files.insert(id, arc);
+        self.files.insert(id, meta);
         id
     }
 
-    fn completed(&self, id: usize) -> bool {
-        let arc = self.files.get(&id).unwrap();
-        arc.partial.load(Ordering::Relaxed) == arc.size
-    }
-
-    fn progress(&self, id: usize) -> f64 {
-        let arc = self.files.get(&id).unwrap();
-        arc.partial.load(Ordering::Relaxed) as f64 / arc.size as f64
+    fn get_info(&self, id: usize) -> Arc<Meta> {
+        self.files.get(&id).unwrap().clone()
     }
 }
 
@@ -235,12 +237,41 @@ impl Drop for DownloadManager {
 
 fn main() {
     let mut url = String::new();
-    std::io::stdin().read_line(&mut url).unwrap();
+    io::stdin().read_line(&mut url).unwrap();
 
     let mut dm = DownloadManager::new();
     let id = dm.download(url.trim().into(), "download".into());
-    while !dm.completed(id) {
-        println!("{}", dm.progress(id));
+    let info = dm.get_info(id);
+    let hdr = &info.header;
+
+    println!();
+
+    loop {
+        let mut l = false;
+        let mut p = 0;
+
+        let mut show = |x: usize, c: char| {
+            while hdr.size * (p + 1) <= 80 * x {
+                print!("{}", c);
+                p += 1;
+            }
+        };
+
+        print!("\x1b[A[");
+
+        for sgm in info.segments.iter() {
+            let download = sgm.downloaded.load(Ordering::Relaxed);
+            l |= download != sgm.size;
+            show(sgm.offset + download, '#');
+            show(sgm.offset + sgm.size, ' ');
+        }
+
+        println!("]");
+
+        if !l {
+            break;
+        }
+
         thread::sleep(Duration::from_secs(1));
     }
 }
