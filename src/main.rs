@@ -3,6 +3,7 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     net::TcpStream,
+    path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
@@ -238,37 +239,51 @@ impl Drop for DownloadManager {
 }
 
 fn main() {
-    let mut url = String::new();
-    io::stdin().read_line(&mut url).unwrap();
-
     let mut dm = DownloadManager::new();
-    let id = dm.download(url.trim().into(), "download".into());
-    let info = dm.get_info(id);
-    let hdr = &info.header;
+    let infos = io::stdin()
+        .lines()
+        .map(|line| {
+            let line = line?;
+            let id = dm.download(
+                line.trim().into(),
+                Path::new(&line)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .into(),
+            );
+            Ok(dm.get_info(id))
+        })
+        .collect::<Result<Vec<_>, io::Error>>()
+        .unwrap();
 
-    println!();
+    for _ in 0..infos.len() {
+        println!();
+    }
 
     loop {
         let mut l = false;
-        let mut p = 0;
+        print!("\x1b[{}A", infos.len());
 
-        let mut show = |x: usize, c: char| {
-            while hdr.size * (p + 1) <= 80 * x {
-                print!("{}", c);
-                p += 1;
+        for info in &infos {
+            let mut p = 0;
+            let mut show = |x: usize, c: char| {
+                while info.header.size * (p + 1) <= 80 * x {
+                    print!("{}", c);
+                    p += 1;
+                }
+            };
+
+            print!("[");
+            for sgm in info.segments.iter() {
+                let download = sgm.downloaded.load(Ordering::Relaxed);
+                l |= download != sgm.size;
+                show(sgm.offset + download, '#');
+                show(sgm.offset + sgm.size, ' ');
             }
-        };
-
-        print!("\x1b[A[");
-
-        for sgm in info.segments.iter() {
-            let download = sgm.downloaded.load(Ordering::Relaxed);
-            l |= download != sgm.size;
-            show(sgm.offset + download, '#');
-            show(sgm.offset + sgm.size, ' ');
+            println!("]");
         }
-
-        println!("]");
 
         if !l {
             break;
