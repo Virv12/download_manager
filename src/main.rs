@@ -76,9 +76,11 @@ struct Meta {
     segments: Box<[Segment]>, // TODO: `Box`-ing is not needed
 }
 
-const THREADS: usize = 64;
-const SEGMENT_SIZE: usize = (2 * 1 << 30) / THREADS;
-const BUFFER: usize = 1 << 20;
+type Message = (Arc<Meta>, usize);
+
+const NUM_THREADS: usize = 64;
+const SEGMENT_SIZE: usize = (2 << 30) / NUM_THREADS;
+const BUFFER_SIZE: usize = 1 << 20;
 
 /// Performs an HTTP/HEAD request and returns the content-length or `None` if not specified
 // TODO: checking for Accept-Ranges: bytes?
@@ -106,7 +108,7 @@ fn get_size(loc: &Location) -> Option<usize> {
                 }
                 buf.make_ascii_lowercase();
                 if let Some(x) = buf.strip_prefix("content-length: ") {
-                    let y: usize = x.trim().parse().unwrap();
+                    let y = x.trim().parse().unwrap();
                     return Some(y);
                 }
             }
@@ -116,7 +118,7 @@ fn get_size(loc: &Location) -> Option<usize> {
     }
 }
 
-fn thread_handler(rx: Arc<Mutex<Receiver<(Arc<Meta>, usize)>>>) {
+fn thread_handler(rx: Arc<Mutex<Receiver<Message>>>) {
     while let Ok((meta, idx)) = {
         let lock = rx.lock().unwrap();
         lock.recv()
@@ -155,7 +157,7 @@ fn thread_handler(rx: Arc<Mutex<Receiver<(Arc<Meta>, usize)>>>) {
                     }
                 }
 
-                let mut buf = [0u8; BUFFER];
+                let mut buf = [0u8; BUFFER_SIZE];
                 loop {
                     let x = reader.read(&mut buf).unwrap();
                     if x == 0 {
@@ -170,7 +172,7 @@ fn thread_handler(rx: Arc<Mutex<Receiver<(Arc<Meta>, usize)>>>) {
 }
 
 struct DownloadManager {
-    tx: Option<Sender<(Arc<Meta>, usize)>>,
+    tx: Option<Sender<Message>>,
     handles: Vec<JoinHandle<()>>,
     files: BTreeMap<usize, Arc<Meta>>,
     id: usize,
@@ -181,7 +183,7 @@ impl DownloadManager {
         let (tx, rx) = mpsc::channel();
         let rx = Arc::new(Mutex::new(rx));
         // TODO: get number of threads
-        let handles = (0..THREADS)
+        let handles = (0..NUM_THREADS)
             .map(|_| {
                 let rx = rx.clone();
                 thread::spawn(move || thread_handler(rx))
