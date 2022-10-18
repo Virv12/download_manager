@@ -93,7 +93,7 @@ fn get_size(loc: &Location) -> Option<usize> {
             uri,
         } => {
             let mut stream = TcpStream::connect(netloc).unwrap();
-            write!(stream, "HEAD {} HTTP/1.0\r\n", uri).unwrap();
+            write!(stream, "HEAD {} HTTP/1.1\r\n", uri).unwrap();
             write!(stream, "Host: {}\r\n", hostname).unwrap();
             write!(stream, "\r\n").unwrap();
 
@@ -120,6 +120,13 @@ fn get_size(loc: &Location) -> Option<usize> {
 }
 
 fn thread_handler(rx: Arc<Mutex<Receiver<Message>>>) {
+    enum OldConn {
+        Http { netloc: String, stream: TcpStream },
+        Null,
+    }
+
+    let mut old_conn = OldConn::Null;
+
     while let Ok((meta, idx)) = {
         let lock = rx.lock().unwrap();
         lock.recv()
@@ -135,8 +142,15 @@ fn thread_handler(rx: Arc<Mutex<Receiver<Message>>>) {
                 hostname,
                 uri,
             } => {
-                let mut stream = TcpStream::connect(netloc).unwrap();
-                write!(stream, "GET {} HTTP/1.0\r\n", uri).unwrap();
+                let mut stream = match old_conn {
+                    OldConn::Http {
+                        netloc: old_netloc,
+                        stream,
+                    } if old_netloc == *netloc => stream, // TODO: check stream is still alive
+                    _ => TcpStream::connect(netloc).unwrap(),
+                };
+
+                write!(stream, "GET {} HTTP/1.1\r\n", uri).unwrap();
                 write!(stream, "Host: {}\r\n", hostname).unwrap();
                 write!(
                     stream,
@@ -158,15 +172,21 @@ fn thread_handler(rx: Arc<Mutex<Receiver<Message>>>) {
                     }
                 }
 
+                let mut downloaded = 0;
                 let mut buf = [0u8; BUFFER_SIZE];
-                loop {
-                    let x = reader.read(&mut buf).unwrap();
-                    if x == 0 {
-                        break;
-                    }
-                    sgm.downloaded.fetch_add(x, Ordering::Relaxed);
+                while downloaded < sgm.size {
+                    let x = reader
+                        .read(&mut buf[..BUFFER_SIZE.min(sgm.size - downloaded)])
+                        .unwrap();
                     file.write_all(&buf[..x]).unwrap();
+                    downloaded += x;
+                    sgm.downloaded.fetch_add(x, Ordering::Relaxed);
                 }
+
+                old_conn = OldConn::Http {
+                    netloc: netloc.into(),
+                    stream: reader.into_inner(),
+                };
             }
         }
     }
