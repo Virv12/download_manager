@@ -28,6 +28,7 @@ impl Drop for Pipe {
     }
 }
 
+#[cfg(feature = "splice_double")]
 pub fn splice<I: AsFd, O: AsFd>(i: &I, o: &O, n: usize, upd: &AtomicUsize) -> io::Result<usize> {
     let rfd = i.as_fd().as_raw_fd();
     let wfd = o.as_fd().as_raw_fd();
@@ -83,4 +84,53 @@ pub fn splice<I: AsFd, O: AsFd>(i: &I, o: &O, n: usize, upd: &AtomicUsize) -> io
     }
 
     Ok(n)
+}
+
+#[cfg(feature = "splice_single")]
+pub fn splice<I: AsFd, O: AsFd>(i: &I, o: &O, size: usize, upd: &AtomicUsize) -> io::Result<usize> {
+    let rfd = i.as_fd().as_raw_fd();
+    let wfd = o.as_fd().as_raw_fd();
+
+    let pipe = Pipe::new()?;
+    let (rpipe, wpipe) = (pipe.0, pipe.1);
+
+    loop {
+        let mut downloaded = unsafe {
+            libc::splice(
+                rfd,
+                ptr::null_mut(),
+                wpipe,
+                ptr::null_mut(),
+                libc::PIPE_BUF,
+                libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MORE,
+            )
+        };
+        if downloaded < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if downloaded == 0 {
+            break;
+        }
+
+        while downloaded > 0 {
+            let written = unsafe {
+                libc::splice(
+                    rpipe,
+                    ptr::null_mut(),
+                    wfd,
+                    ptr::null_mut(),
+                    downloaded as usize,
+                    libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MORE,
+                )
+            };
+            if written < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            downloaded -= written;
+            upd.fetch_add(written as usize, Ordering::Relaxed);
+        }
+    }
+
+    Ok(size)
 }
