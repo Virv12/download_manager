@@ -170,6 +170,7 @@ fn thread_handler(rx: Arc<Mutex<Receiver<Message>>>) {
                         if x == 0 {
                             break;
                         }
+                        #[cfg(feature = "progress")]
                         sgm.downloaded.fetch_add(x, Ordering::Relaxed);
                         file.write_all(&buf[..x]).unwrap();
                     }
@@ -180,6 +181,7 @@ fn thread_handler(rx: Arc<Mutex<Receiver<Message>>>) {
                     let buf = reader.buffer();
                     let len = buf.len();
                     file.write_all(buf).unwrap();
+                    #[cfg(feature = "progress")]
                     sgm.downloaded.fetch_add(len, Ordering::Relaxed);
 
                     let x = splice::splice(
@@ -282,37 +284,40 @@ fn main() {
         .collect::<Result<Vec<_>, io::Error>>()
         .unwrap();
 
-    for _ in 0..infos.len() {
-        println!();
-    }
+    #[cfg(feature = "progress")]
+    {
+        for _ in 0..infos.len() {
+            println!();
+        }
 
-    loop {
-        let mut l = false;
-        print!("\x1b[{}A", infos.len());
+        loop {
+            let mut l = false;
+            print!("\x1b[{}A", infos.len());
 
-        for info in &infos {
-            let mut p = 0;
-            let mut show = |x: usize, c: char| {
-                while info.header.size * (p + 1) <= 80 * x {
-                    print!("{}", c);
-                    p += 1;
+            for info in &infos {
+                let mut p = 0;
+                let mut show = |x: usize, c: char| {
+                    while info.header.size * (p + 1) <= 80 * x {
+                        print!("{}", c);
+                        p += 1;
+                    }
+                };
+
+                print!("[");
+                for sgm in info.segments.iter() {
+                    let download = sgm.downloaded.load(Ordering::Relaxed);
+                    l |= download != sgm.size;
+                    show(sgm.offset + download, '#');
+                    show(sgm.offset + sgm.size, ' ');
                 }
-            };
-
-            print!("[");
-            for sgm in info.segments.iter() {
-                let download = sgm.downloaded.load(Ordering::Relaxed);
-                l |= download != sgm.size;
-                show(sgm.offset + download, '#');
-                show(sgm.offset + sgm.size, ' ');
+                println!("]");
             }
-            println!("]");
-        }
 
-        if !l {
-            break;
-        }
+            if !l {
+                break;
+            }
 
-        thread::sleep(Duration::from_secs(1));
+            thread::sleep(Duration::from_secs(1));
+        }
     }
 }

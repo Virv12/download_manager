@@ -74,6 +74,7 @@ pub fn splice<I: AsFd, O: AsFd>(i: &I, o: &O, n: usize, upd: &AtomicUsize) -> io
             };
             if t > 0 {
                 p += t as usize;
+                #[cfg(feature = "progress")]
                 upd.fetch_add(t as usize, Ordering::Relaxed);
             } else if t < 0 {
                 return Err(io::Error::last_os_error());
@@ -128,6 +129,7 @@ pub fn splice<I: AsFd, O: AsFd>(i: &I, o: &O, size: usize, upd: &AtomicUsize) ->
             }
 
             downloaded -= written;
+            #[cfg(feature = "progress")]
             upd.fetch_add(written as usize, Ordering::Relaxed);
         }
     }
