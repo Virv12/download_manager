@@ -56,3 +56,6 @@ Temporary Items
 
 ### JetBrains
 .idea/
+
+### Benchmarking
+**/*.csv
