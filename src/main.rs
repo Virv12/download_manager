@@ -1,3 +1,6 @@
+#[cfg(feature = "splice")]
+mod splice;
+
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -81,6 +84,7 @@ type Message = (Arc<Meta>, usize);
 
 const NUM_THREADS: usize = 64;
 const SEGMENT_SIZE: usize = (2 << 30) / NUM_THREADS;
+#[cfg(not(feature = "splice"))]
 const BUFFER_SIZE: usize = 1 << 20;
 
 /// Performs an HTTP/HEAD request and returns the content-length or `None` if not specified
@@ -158,14 +162,34 @@ fn thread_handler(rx: Arc<Mutex<Receiver<Message>>>) {
                     }
                 }
 
-                let mut buf = [0u8; BUFFER_SIZE];
-                loop {
-                    let x = reader.read(&mut buf).unwrap();
-                    if x == 0 {
-                        break;
+                #[cfg(not(feature = "splice"))]
+                {
+                    let mut buf = [0u8; BUFFER_SIZE];
+                    loop {
+                        let x = reader.read(&mut buf).unwrap();
+                        if x == 0 {
+                            break;
+                        }
+                        sgm.downloaded.fetch_add(x, Ordering::Relaxed);
+                        file.write_all(&buf[..x]).unwrap();
                     }
-                    sgm.downloaded.fetch_add(x, Ordering::Relaxed);
-                    file.write_all(&buf[..x]).unwrap();
+                }
+
+                #[cfg(feature = "splice")]
+                {
+                    let buf = reader.buffer();
+                    let len = buf.len();
+                    file.write_all(buf).unwrap();
+                    sgm.downloaded.fetch_add(len, Ordering::Relaxed);
+
+                    let x = splice::splice(
+                        &reader.into_inner(),
+                        &file,
+                        sgm.size - len,
+                        &sgm.downloaded,
+                    )
+                    .unwrap();
+                    assert_eq!(x, sgm.size - len);
                 }
             }
         }
