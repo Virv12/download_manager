@@ -82,10 +82,28 @@ struct Meta {
 
 type Message = (Arc<Meta>, usize);
 
-const NUM_THREADS: usize = 64;
-const SEGMENT_SIZE: usize = (2 << 30) / NUM_THREADS;
+const fn parse_or(s: Option<&str>, default: usize) -> usize {
+    const fn rec(x: usize, s: &[u8]) -> usize {
+        if let Some((&c, s)) = s.split_first() {
+            match c {
+                b'0'..=b'9' => rec(10 * x + (c as usize - b'0' as usize), s),
+                _ => panic!("Error parsing constants"),
+            }
+        } else {
+            x
+        }
+    }
+
+    match s {
+        Some(s) => rec(0, s.as_bytes()),
+        None => default,
+    }
+}
+
+const NUM_THREADS: usize = parse_or(option_env!("NUM_THREADS"), 64);
+const SEGMENT_SIZE: usize = parse_or(option_env!("SEGMENT_SIZE"), 1 << 20);
 #[cfg(not(feature = "splice"))]
-const BUFFER_SIZE: usize = 1 << 20;
+const BUFFER_SIZE: usize = parse_or(option_env!("BUFFER_SIZE"), 1 << 20);
 
 /// Performs an HTTP/HEAD request and returns the content-length or `None` if not specified
 // TODO: checking for Accept-Ranges: bytes?
