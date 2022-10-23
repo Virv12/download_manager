@@ -1,145 +1,34 @@
-#[cfg(feature = "splice")]
-mod splice;
-
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
-    net::TcpStream,
-    path::Path,
+    io::{self, Seek, SeekFrom},
+    path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        mpsc::{self, Receiver, Sender},
-        Arc, Mutex,
+        Arc,
+        mpsc::{self, Receiver, Sender}, Mutex,
     },
     thread::{self, JoinHandle},
+};
+
+use url::Url;
+
+#[cfg(feature = "progress")]
+use {
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
-use urlparse::Url;
+use crate::meta::Meta;
+use crate::utility::parse_or;
 
-enum Location {
-    Http {
-        netloc: String,
-        hostname: String,
-        uri: String,
-    },
-}
+mod schema;
+mod meta;
 
-impl From<String> for Location {
-    fn from(url: String) -> Location {
-        let Url {
-            scheme,
-            mut netloc,
-            path,
-            query,
-            fragment,
-            hostname,
-            port,
-            ..
-        } = urlparse::urlparse(url);
-
-        assert_eq!(scheme, "http");
-
-        if port.is_none() {
-            netloc += ":80";
-        }
-
-        let mut uri = path;
-        if let Some(query) = &query {
-            uri.push('?');
-            uri += query;
-        }
-        if let Some(fragment) = &fragment {
-            uri.push('#');
-            uri += fragment;
-        }
-
-        Location::Http {
-            netloc,
-            hostname: hostname.unwrap(),
-            uri,
-        }
-    }
-}
-
-struct Header {
-    loc: Location,
-    path: String,
-    size: usize,
-}
-
-struct Segment {
-    offset: usize,
-    size: usize,
-    downloaded: AtomicUsize,
-}
-
-struct Meta {
-    header: Header,
-    segments: Box<[Segment]>, // TODO: `Box`-ing is not needed
-}
+mod utility;
 
 type Message = (Arc<Meta>, usize);
 
-const fn parse_or(s: Option<&str>, default: usize) -> usize {
-    const fn rec(x: usize, s: &[u8]) -> usize {
-        if let Some((&c, s)) = s.split_first() {
-            match c {
-                b'0'..=b'9' => rec(10 * x + (c as usize - b'0' as usize), s),
-                _ => panic!("Error parsing constants"),
-            }
-        } else {
-            x
-        }
-    }
-
-    match s {
-        Some(s) => rec(0, s.as_bytes()),
-        None => default,
-    }
-}
-
 const NUM_THREADS: usize = parse_or(option_env!("NUM_THREADS"), 64);
-const SEGMENT_SIZE: usize = parse_or(option_env!("SEGMENT_SIZE"), 1 << 20);
-#[cfg(not(feature = "splice"))]
-const BUFFER_SIZE: usize = parse_or(option_env!("BUFFER_SIZE"), 1 << 20);
-
-/// Performs an HTTP/HEAD request and returns the content-length or `None` if not specified
-// TODO: checking for Accept-Ranges: bytes?
-fn get_size(loc: &Location) -> Option<usize> {
-    match loc {
-        Location::Http {
-            netloc,
-            hostname,
-            uri,
-        } => {
-            let mut stream = TcpStream::connect(netloc).unwrap();
-            write!(stream, "HEAD {} HTTP/1.0\r\n", uri).unwrap();
-            write!(stream, "Host: {}\r\n", hostname).unwrap();
-            write!(stream, "\r\n").unwrap();
-
-            // TODO: do we really want a BufRead?
-            let mut reader = BufReader::new(stream);
-            let mut buf = String::new();
-
-            loop {
-                buf.clear();
-                let n = reader.read_line(&mut buf).unwrap();
-                if n <= 2 {
-                    break;
-                }
-                buf.make_ascii_lowercase();
-                if let Some(x) = buf.strip_prefix("content-length: ") {
-                    let y = x.trim().parse().unwrap();
-                    return Some(y);
-                }
-            }
-
-            None
-        }
-    }
-}
 
 fn thread_handler(rx: Arc<Mutex<Receiver<Message>>>) {
     while let Ok((meta, idx)) = {
@@ -150,69 +39,7 @@ fn thread_handler(rx: Arc<Mutex<Receiver<Message>>>) {
         let sgm = &meta.segments[idx];
         let mut file = File::options().write(true).open(&hdr.path).unwrap();
         file.seek(SeekFrom::Start(sgm.offset as u64)).unwrap();
-
-        match &hdr.loc {
-            Location::Http {
-                netloc,
-                hostname,
-                uri,
-            } => {
-                let mut stream = TcpStream::connect(netloc).unwrap();
-                write!(stream, "GET {} HTTP/1.0\r\n", uri).unwrap();
-                write!(stream, "Host: {}\r\n", hostname).unwrap();
-                write!(
-                    stream,
-                    "Range: bytes={}-{}\r\n",
-                    sgm.offset,
-                    sgm.offset + sgm.size - 1
-                )
-                .unwrap();
-                write!(stream, "\r\n").unwrap();
-
-                // TODO: do we really want a BufRead?
-                let mut reader = BufReader::new(stream);
-                let mut buf = String::new();
-                loop {
-                    buf.clear();
-                    let n = reader.read_line(&mut buf).unwrap();
-                    if n <= 2 {
-                        break;
-                    }
-                }
-
-                #[cfg(not(feature = "splice"))]
-                {
-                    let mut buf = [0u8; BUFFER_SIZE];
-                    loop {
-                        let x = reader.read(&mut buf).unwrap();
-                        if x == 0 {
-                            break;
-                        }
-                        #[cfg(feature = "progress")]
-                        sgm.downloaded.fetch_add(x, Ordering::Relaxed);
-                        file.write_all(&buf[..x]).unwrap();
-                    }
-                }
-
-                #[cfg(feature = "splice")]
-                {
-                    let buf = reader.buffer();
-                    let len = buf.len();
-                    file.write_all(buf).unwrap();
-                    #[cfg(feature = "progress")]
-                    sgm.downloaded.fetch_add(len, Ordering::Relaxed);
-
-                    let x = splice::splice(
-                        &reader.into_inner(),
-                        &file,
-                        sgm.size - len,
-                        &sgm.downloaded,
-                    )
-                    .unwrap();
-                    assert_eq!(x, sgm.size - len);
-                }
-            }
-        }
+        hdr.scheme().unwrap().handle(hdr, sgm, file);
     }
 }
 
@@ -244,22 +71,12 @@ impl DownloadManager {
         }
     }
 
-    fn download(&mut self, url: String, path: String) -> usize {
-        let loc = url.into();
-        let size = get_size(&loc).unwrap();
+    fn download(&mut self, url: Url, path: PathBuf) -> usize {
         File::create(&path).unwrap();
+        let meta = Arc::new(Meta::new(url, path));
+
         let id = self.id;
         self.id += 1;
-
-        let header = Header { loc, path, size };
-        let segments: Box<_> = (0..(size + SEGMENT_SIZE - 1) / SEGMENT_SIZE)
-            .map(|x| Segment {
-                offset: SEGMENT_SIZE * x,
-                size: SEGMENT_SIZE.min(size - SEGMENT_SIZE * x),
-                downloaded: Default::default(),
-            })
-            .collect();
-        let meta = Arc::new(Meta { header, segments });
 
         for idx in 0..meta.segments.len() {
             self.tx.as_ref().unwrap().send((meta.clone(), idx)).unwrap();
@@ -289,7 +106,7 @@ fn main() {
         .map(|line| {
             let line = line?;
             let id = dm.download(
-                line.trim().into(),
+                line.trim().try_into().unwrap(),
                 Path::new(&line)
                     .file_name()
                     .unwrap()
