@@ -1,3 +1,6 @@
+#[cfg(feature = "splice")]
+mod splice;
+
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -79,9 +82,28 @@ struct Meta {
 
 type Message = (Arc<Meta>, usize);
 
-const NUM_THREADS: usize = 64;
-const SEGMENT_SIZE: usize = (2 << 30) / NUM_THREADS;
-const BUFFER_SIZE: usize = 1 << 20;
+const fn parse_or(s: Option<&str>, default: usize) -> usize {
+    const fn rec(x: usize, s: &[u8]) -> usize {
+        if let Some((&c, s)) = s.split_first() {
+            match c {
+                b'0'..=b'9' => rec(10 * x + (c as usize - b'0' as usize), s),
+                _ => panic!("Error parsing constants"),
+            }
+        } else {
+            x
+        }
+    }
+
+    match s {
+        Some(s) => rec(0, s.as_bytes()),
+        None => default,
+    }
+}
+
+const NUM_THREADS: usize = parse_or(option_env!("NUM_THREADS"), 64);
+const SEGMENT_SIZE: usize = parse_or(option_env!("SEGMENT_SIZE"), 1 << 20);
+#[cfg(not(feature = "splice"))]
+const BUFFER_SIZE: usize = parse_or(option_env!("BUFFER_SIZE"), 1 << 20);
 
 /// Performs an HTTP/HEAD request and returns the content-length or `None` if not specified
 // TODO: checking for Accept-Ranges: bytes?
@@ -158,14 +180,36 @@ fn thread_handler(rx: Arc<Mutex<Receiver<Message>>>) {
                     }
                 }
 
-                let mut buf = [0u8; BUFFER_SIZE];
-                loop {
-                    let x = reader.read(&mut buf).unwrap();
-                    if x == 0 {
-                        break;
+                #[cfg(not(feature = "splice"))]
+                {
+                    let mut buf = [0u8; BUFFER_SIZE];
+                    loop {
+                        let x = reader.read(&mut buf).unwrap();
+                        if x == 0 {
+                            break;
+                        }
+                        #[cfg(feature = "progress")]
+                        sgm.downloaded.fetch_add(x, Ordering::Relaxed);
+                        file.write_all(&buf[..x]).unwrap();
                     }
-                    sgm.downloaded.fetch_add(x, Ordering::Relaxed);
-                    file.write_all(&buf[..x]).unwrap();
+                }
+
+                #[cfg(feature = "splice")]
+                {
+                    let buf = reader.buffer();
+                    let len = buf.len();
+                    file.write_all(buf).unwrap();
+                    #[cfg(feature = "progress")]
+                    sgm.downloaded.fetch_add(len, Ordering::Relaxed);
+
+                    let x = splice::splice(
+                        &reader.into_inner(),
+                        &file,
+                        sgm.size - len,
+                        &sgm.downloaded,
+                    )
+                    .unwrap();
+                    assert_eq!(x, sgm.size - len);
                 }
             }
         }
@@ -258,37 +302,40 @@ fn main() {
         .collect::<Result<Vec<_>, io::Error>>()
         .unwrap();
 
-    for _ in 0..infos.len() {
-        println!();
-    }
+    #[cfg(feature = "progress")]
+    {
+        for _ in 0..infos.len() {
+            println!();
+        }
 
-    loop {
-        let mut l = false;
-        print!("\x1b[{}A", infos.len());
+        loop {
+            let mut l = false;
+            print!("\x1b[{}A", infos.len());
 
-        for info in &infos {
-            let mut p = 0;
-            let mut show = |x: usize, c: char| {
-                while info.header.size * (p + 1) <= 80 * x {
-                    print!("{}", c);
-                    p += 1;
+            for info in &infos {
+                let mut p = 0;
+                let mut show = |x: usize, c: char| {
+                    while info.header.size * (p + 1) <= 80 * x {
+                        print!("{}", c);
+                        p += 1;
+                    }
+                };
+
+                print!("[");
+                for sgm in info.segments.iter() {
+                    let download = sgm.downloaded.load(Ordering::Relaxed);
+                    l |= download != sgm.size;
+                    show(sgm.offset + download, '#');
+                    show(sgm.offset + sgm.size, ' ');
                 }
-            };
-
-            print!("[");
-            for sgm in info.segments.iter() {
-                let download = sgm.downloaded.load(Ordering::Relaxed);
-                l |= download != sgm.size;
-                show(sgm.offset + download, '#');
-                show(sgm.offset + sgm.size, ' ');
+                println!("]");
             }
-            println!("]");
-        }
 
-        if !l {
-            break;
-        }
+            if !l {
+                break;
+            }
 
-        thread::sleep(Duration::from_secs(1));
+            thread::sleep(Duration::from_secs(1));
+        }
     }
 }

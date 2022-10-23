@@ -4,4 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+libc = "*"
 urlparse = "*"
+
+[features]
+splice = []
+splice_single = ["splice"]
+splice_double = ["splice"]
+progress = []
