@@ -59,6 +59,8 @@ Temporary Items
 
 ### Benchmarking
 **/*.csv
+bench*/
+graphs*/
 
 ### Python
 # Byte-compiled / optimized / DLL files

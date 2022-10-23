@@ -33,6 +33,7 @@ FIELDS = {
     'version': str,
     'thread': int,
     'segment_size': int,
+    'buffer_size': int,
     'iteration': int,
     'usr_time': float,
     'sys_time': float,
@@ -64,9 +65,20 @@ HASH_MAP = {
 
 
 def to_csv(root: Path, output: Path):
-    def parse(result: Path):
+    def parse_hashes(result: Path):
         yield HASH_MAP[result.parent.name]
         yield from result.name.split('_')
+        yield from [match(r'.+?: (.+)', s.strip()).group(1)
+                    for s in result.read_text().splitlines()][1:]
+
+    def parse(result: Path):
+        version = result.name[:result.name.find('-')]
+        env = result.name.split('-')
+
+        if version == 'splice_single' or version == 'splice_double':
+            env.insert(3, '-1')
+
+        yield from env
         yield from [match(r'.+?: (.+)', s.strip()).group(1)
                     for s in result.read_text().splitlines()][1:]
 
