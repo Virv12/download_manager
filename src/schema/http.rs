@@ -1,17 +1,19 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(not(feature = "splice"))]
+use std::io::Read;
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 #[cfg(feature = "progress")]
 use std::sync::atomic::Ordering;
 
 use url::Url;
 
-#[cfg(not(feature = "splice"))]
-use crate::utility::parse_or;
 use crate::meta::{Header, Segment};
 use crate::schema::Schema;
+#[cfg(not(feature = "splice"))]
+use crate::utility::parse_or;
 #[cfg(feature = "splice")]
-use crate::splice;
+use crate::utility::splice;
 
 #[cfg(not(feature = "splice"))]
 const BUFFER_SIZE: usize = parse_or(option_env!("BUFFER_SIZE"), 1 << 20);
@@ -23,7 +25,16 @@ fn netloc(url: &Url) -> String {
 }
 
 fn query(url: &Url) -> String {
-    format!("{}?{}#{}", url.path(), url.query().unwrap_or(""), url.fragment().unwrap_or(""))
+    let mut s = url.path().to_owned();
+    if let Some(query) = url.query() {
+        s += "?";
+        s += query;
+    }
+    if let Some(fragment) = url.fragment() {
+        s += "#";
+        s += fragment;
+    }
+    s
 }
 
 impl Schema for Http {
@@ -59,8 +70,15 @@ impl Schema for Http {
     fn handle(&self, hdr: &Header, sgm: &Segment, mut file: File) {
         let url = &hdr.url;
         let mut stream = TcpStream::connect(netloc(url)).unwrap();
-        write!(stream, "HEAD {} HTTP/1.0\r\n", query(url)).unwrap();
+        write!(stream, "GET {} HTTP/1.0\r\n", query(url)).unwrap();
         write!(stream, "Host: {}\r\n", url.host_str().unwrap()).unwrap();
+        write!(
+            stream,
+            "Range: bytes={}-{}\r\n",
+            sgm.offset,
+            sgm.offset + sgm.size - 1
+        )
+        .unwrap();
         write!(stream, "\r\n").unwrap();
 
         // TODO: do we really want a BufRead?
@@ -97,12 +115,8 @@ impl Schema for Http {
             #[cfg(feature = "progress")]
             sgm.downloaded.fetch_add(len, Ordering::Relaxed);
 
-            let x = splice::splice(
-                &reader.into_inner(),
-                &file,
-                sgm.size - len,
-                &sgm.downloaded,
-            ).unwrap();
+            let x = splice::splice(&reader.into_inner(), &file, sgm.size - len, &sgm.downloaded)
+                .unwrap();
             assert_eq!(x, sgm.size - len);
         }
     }

@@ -3,8 +3,8 @@ use std::sync::atomic::AtomicUsize;
 
 use url::Url;
 
+use crate::schema::{Http, Schema};
 use crate::utility::parse_or;
-use crate::schema::{Schema, Http};
 
 const SEGMENT_SIZE: usize = parse_or(option_env!("SEGMENT_SIZE"), 1 << 20);
 
@@ -37,7 +37,9 @@ impl Header {
     }
 
     fn request_size(url: &Url) -> Option<usize> {
-        (url.scheme().try_into() as Result<&dyn Schema, _>).unwrap().size(url)
+        (url.scheme().try_into() as Result<&dyn Schema, _>)
+            .unwrap()
+            .size(url)
     }
 }
 

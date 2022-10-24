@@ -4,8 +4,8 @@ use std::{
     io::{self, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        mpsc::{self, Receiver, Sender}, Mutex,
+        mpsc::{self, Receiver, Sender},
+        Arc, Mutex,
     },
     thread::{self, JoinHandle},
 };
@@ -13,16 +13,13 @@ use std::{
 use url::Url;
 
 #[cfg(feature = "progress")]
-use {
-    sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
-};
+use std::{sync::atomic::Ordering, time::Duration};
 
 use crate::meta::Meta;
 use crate::utility::parse_or;
 
-mod schema;
 mod meta;
+mod schema;
 
 mod utility;
 
