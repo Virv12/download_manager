@@ -12,3 +12,14 @@ pub trait Schema {
     // TODO: Better abstraction than File.
     fn handle(&self, header: &Header, segment: &Segment, file: File);
 }
+
+impl TryFrom<&str> for &dyn Schema {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "http" => Ok(&Http {}),
+            _ => Err(()),
+        }
+    }
+}

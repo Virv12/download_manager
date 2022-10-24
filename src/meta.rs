@@ -1,23 +1,10 @@
-use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
+use std::{path::PathBuf, sync::atomic::AtomicUsize};
 
 use url::Url;
 
-use crate::schema::{Http, Schema};
-use crate::utility::parse_or;
+use crate::{schema::Schema, utility};
 
-const SEGMENT_SIZE: usize = parse_or(option_env!("SEGMENT_SIZE"), 1 << 20);
-
-impl TryFrom<&str> for &dyn Schema {
-    type Error = ();
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "http" => Ok(&Http {}),
-            _ => Err(()),
-        }
-    }
-}
+const SEGMENT_SIZE: usize = utility::parse_or(option_env!("SEGMENT_SIZE"), 1 << 20);
 
 pub struct Header {
     pub url: Url,

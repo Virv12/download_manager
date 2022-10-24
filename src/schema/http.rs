@@ -1,22 +1,24 @@
-use std::fs::File;
+use std::{
+    fs::File,
+    io::{BufRead, BufReader, Write},
+    net::TcpStream,
+};
+
 #[cfg(not(feature = "splice"))]
 use std::io::Read;
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
 #[cfg(feature = "progress")]
 use std::sync::atomic::Ordering;
 
 use url::Url;
 
-use crate::meta::{Header, Segment};
-use crate::schema::Schema;
-#[cfg(not(feature = "splice"))]
-use crate::utility::parse_or;
-#[cfg(feature = "splice")]
-use crate::utility::splice;
+use crate::{
+    meta::{Header, Segment},
+    schema::Schema,
+    utility,
+};
 
 #[cfg(not(feature = "splice"))]
-const BUFFER_SIZE: usize = parse_or(option_env!("BUFFER_SIZE"), 1 << 20);
+const BUFFER_SIZE: usize = utility::parse_or(option_env!("BUFFER_SIZE"), 1 << 20);
 
 pub struct Http {}
 
@@ -115,7 +117,7 @@ impl Schema for Http {
             #[cfg(feature = "progress")]
             sgm.downloaded.fetch_add(len, Ordering::Relaxed);
 
-            let x = splice::splice(&reader.into_inner(), &file, sgm.size - len, &sgm.downloaded)
+            let x = utility::splice(&reader.into_inner(), &file, sgm.size - len, &sgm.downloaded)
                 .unwrap();
             assert_eq!(x, sgm.size - len);
         }

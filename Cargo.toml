@@ -9,6 +9,5 @@ libc = "*"
 
 [features]
 splice = []
-splice_single = ["splice"]
 splice_double = ["splice"]
 progress = []

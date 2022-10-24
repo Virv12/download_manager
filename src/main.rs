@@ -1,7 +1,6 @@
 use std::{
-    collections::BTreeMap,
     fs::File,
-    io::{self, Seek, SeekFrom},
+    io::{self, Seek, SeekFrom, Error},
     path::{Path, PathBuf},
     sync::{
         mpsc::{self, Receiver, Sender},
@@ -10,22 +9,20 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use url::Url;
-
 #[cfg(feature = "progress")]
 use std::{sync::atomic::Ordering, time::Duration};
 
+use url::Url;
+
 use crate::meta::Meta;
-use crate::utility::parse_or;
 
 mod meta;
 mod schema;
-
 mod utility;
 
 type Message = (Arc<Meta>, usize);
 
-const NUM_THREADS: usize = parse_or(option_env!("NUM_THREADS"), 64);
+const NUM_THREADS: usize = utility::parse_or(option_env!("NUM_THREADS"), 64);
 
 fn thread_handler(rx: Arc<Mutex<Receiver<Message>>>) {
     while let Ok((meta, idx)) = {
@@ -41,56 +38,39 @@ fn thread_handler(rx: Arc<Mutex<Receiver<Message>>>) {
 }
 
 struct DownloadManager {
+    // TODO: find a solution without Option
     tx: Option<Sender<Message>>,
-    handles: Vec<JoinHandle<()>>,
-    files: BTreeMap<usize, Arc<Meta>>,
-    id: usize,
+    handles: Option<Box<[JoinHandle<()>; NUM_THREADS]>>,
 }
 
 impl DownloadManager {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel();
         let rx = Arc::new(Mutex::new(rx));
-        // TODO: get number of threads
-        let handles = (0..NUM_THREADS)
-            .map(|_| {
-                let rx = rx.clone();
-                thread::spawn(move || thread_handler(rx))
-            })
-            .collect();
-        let files = BTreeMap::new();
-        let id = 0;
+        let handles = Box::new([(); NUM_THREADS].map(|_| {
+            let rx = rx.clone();
+            thread::spawn(move || thread_handler(rx))
+        }));
         DownloadManager {
             tx: Some(tx),
-            handles,
-            files,
-            id,
+            handles: Some(handles),
         }
     }
 
-    fn download(&mut self, url: Url, path: PathBuf) -> usize {
+    fn download(&mut self, url: Url, path: PathBuf) -> Arc<Meta> {
         File::create(&path).unwrap();
         let meta = Arc::new(Meta::new(url, path));
-
-        let id = self.id;
-        self.id += 1;
-
         for idx in 0..meta.segments.len() {
             self.tx.as_ref().unwrap().send((meta.clone(), idx)).unwrap();
         }
-        self.files.insert(id, meta);
-        id
-    }
-
-    fn get_info(&self, id: usize) -> Arc<Meta> {
-        self.files.get(&id).unwrap().clone()
+        meta
     }
 }
 
 impl Drop for DownloadManager {
     fn drop(&mut self) {
         self.tx.take();
-        for handle in self.handles.drain(..) {
+        for handle in self.handles.take().unwrap().into_iter() {
             handle.join().unwrap();
         }
     }
@@ -102,18 +82,12 @@ fn main() {
         .lines()
         .map(|line| {
             let line = line?;
-            let id = dm.download(
+            Ok(dm.download(
                 line.trim().try_into().unwrap(),
-                Path::new(&line)
-                    .file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .into(),
-            );
-            Ok(dm.get_info(id))
+                Path::new(&line).file_name().unwrap().into(),
+            ))
         })
-        .collect::<Result<Vec<_>, io::Error>>()
+        .collect::<Result<Vec<_>, Error>>()
         .unwrap();
 
     #[cfg(feature = "progress")]

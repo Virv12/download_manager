@@ -1,5 +1,5 @@
 use std::{
-    io,
+    io::{self, Error},
     os::unix::io::{AsFd, AsRawFd},
     ptr,
     sync::atomic::{AtomicUsize, Ordering},
@@ -12,7 +12,7 @@ impl Pipe {
         let mut pipes = [0 as libc::c_int; 2];
         unsafe {
             if libc::pipe2(&mut pipes as *mut libc::c_int, libc::O_NONBLOCK) < 0 {
-                return Err(io::Error::last_os_error());
+                return Err(Error::last_os_error());
             }
         }
         Ok(Pipe(pipes[0], pipes[1]))
@@ -54,7 +54,7 @@ pub fn splice<I: AsFd, O: AsFd>(i: &I, o: &O, n: usize, upd: &AtomicUsize) -> io
             if t > 0 {
                 z += t as usize;
             } else if t < 0 {
-                return Err(io::Error::last_os_error());
+                return Err(Error::last_os_error());
             } else {
                 done = true;
                 break;
@@ -77,7 +77,7 @@ pub fn splice<I: AsFd, O: AsFd>(i: &I, o: &O, n: usize, upd: &AtomicUsize) -> io
                 #[cfg(feature = "progress")]
                 upd.fetch_add(t as usize, Ordering::Relaxed);
             } else if t < 0 {
-                return Err(io::Error::last_os_error());
+                return Err(Error::last_os_error());
             } else {
                 unreachable!();
             }
@@ -87,7 +87,7 @@ pub fn splice<I: AsFd, O: AsFd>(i: &I, o: &O, n: usize, upd: &AtomicUsize) -> io
     Ok(n)
 }
 
-#[cfg(feature = "splice_single")]
+#[cfg(not(feature = "splice_double"))]
 pub fn splice<I: AsFd, O: AsFd>(i: &I, o: &O, size: usize, upd: &AtomicUsize) -> io::Result<usize> {
     let rfd = i.as_fd().as_raw_fd();
     let wfd = o.as_fd().as_raw_fd();
@@ -107,7 +107,7 @@ pub fn splice<I: AsFd, O: AsFd>(i: &I, o: &O, size: usize, upd: &AtomicUsize) ->
             )
         };
         if downloaded < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Error::last_os_error());
         }
         if downloaded == 0 {
             break;
@@ -125,7 +125,7 @@ pub fn splice<I: AsFd, O: AsFd>(i: &I, o: &O, size: usize, upd: &AtomicUsize) ->
                 )
             };
             if written < 0 {
-                return Err(io::Error::last_os_error());
+                return Err(Error::last_os_error());
             }
 
             downloaded -= written;
